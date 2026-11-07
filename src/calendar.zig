@@ -78,6 +78,12 @@ pub const Calendar = struct {
         return t;
     }
 
+    /// Adds `other`'s counts day by day. Both windows must cover the same days.
+    pub fn merge(self: *Calendar, other: *const Calendar) void {
+        std.debug.assert(self.start == other.start);
+        for (&self.counts, other.counts) |*a, b| a.* += b;
+    }
+
     pub fn maxWeekTotal(self: *const Calendar) u32 {
         var m: u32 = 0;
         for (0..weeks) |w| m = @max(m, self.weekTotal(w, days));
@@ -139,6 +145,19 @@ test "stats: streaks, totals and busiest day" {
     try std.testing.expectEqual(@as(u32, 2), s.current_streak);
     try std.testing.expectEqual(@as(u32, 9), s.busiest_count);
     try std.testing.expectEqual(@as(usize, cal.lastIndex() - 1), s.busiest_index);
+}
+
+test "merge adds day by day" {
+    const end = (try date.Date.parse("2026-11-07")).toEpochDay();
+    var a = Calendar.init(end);
+    var b = Calendar.init(end);
+    a.add(end, 2);
+    b.add(end, 3);
+    b.add(end - 5, 1);
+    a.merge(&b);
+    try std.testing.expectEqual(@as(u32, 5), a.counts[a.indexOf(end).?]);
+    try std.testing.expectEqual(@as(u32, 1), a.counts[a.indexOf(end - 5).?]);
+    try std.testing.expectEqual(@as(u32, 3), b.counts[b.indexOf(end).?]); // source untouched
 }
 
 test "stats: gap before today resets the streak" {

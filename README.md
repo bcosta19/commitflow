@@ -13,7 +13,7 @@ zig build -Doptimize=ReleaseSafe
 ./zig-out/bin/commitflow --static              # só o último frame (também se stdout não for TTY)
 ```
 
-Opções: `--end YYYY-MM-DD`, `--duration SEGUNDOS` (6), `--fps N` (30), `--no-color`, `--config CAMINHO`. `NO_COLOR` é respeitado. Ctrl-C restaura o cursor.
+Opções: `--end YYYY-MM-DD`, `--duration SEGUNDOS` (6), `--fps N` (30), `--no-color`, `--config CAMINHO`, `--refresh`, `--no-cache`. `NO_COLOR` é respeitado. Ctrl-C restaura o cursor.
 
 ### Fontes
 
@@ -31,6 +31,16 @@ gitlab = gitlab.example.org/alice
 ```
 
 Uma fonte que falha (ex.: GitLab interno sem VPN, timeout de 25 s) vira aviso e as demais continuam.
+
+### Cache (GitLab)
+
+Cada conta GitLab tem um arquivo binário em `$XDG_CACHE_HOME/commitflow/` (padrão `~/.cache/commitflow/`), com as contagens por dia (36 bytes de cabeçalho + 4 bytes por dia, ~1,5 KB). A cada execução o programa faz uma única chamada (`users/:id/events?per_page=1`) e compara o id do push mais recente com o do cache:
+
+- igual → usa o cache (~0,2 s em vez de ~18 s);
+- diferente → rescan completo, que regrava o cache;
+- cache com mais de 7 dias, que não cobre a janela, corrompido, de outro usuário (`@me` trocou de conta) ou `--refresh` → rescan completo.
+
+Limites: rebase, force-push ou branch apagada não geram push novo; o TTL de 7 dias (ou `--refresh`) corrige isso. Um scan em que algum projeto falhou não é gravado. O GitHub não usa cache (2 chamadas, ~1,3 s). `--no-cache` desliga leitura e escrita.
 
 ### O que é contado
 

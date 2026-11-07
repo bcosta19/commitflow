@@ -11,6 +11,7 @@ const Io = std.Io;
 const Allocator = std.mem.Allocator;
 const calendar = @import("calendar.zig");
 const date = @import("date.zig");
+const cache = @import("cache.zig");
 
 pub const me = "@me";
 pub const default_gitlab_host = "gitlab.com";
@@ -39,12 +40,19 @@ pub const Source = union(enum) {
 
 pub const FetchError = error{ SourceFailed, BadResponse } || Allocator.Error;
 
+pub const CacheConfig = struct {
+    /// Directory for cache files; null disables caching.
+    dir: ?[]const u8 = null,
+    /// Ignore existing cache files (they are still rewritten).
+    refresh: bool = false,
+};
+
 /// Adds the source's per-day counts to `cal`. Returns the number of commits/contributions added.
 /// On failure the reason is printed to stderr and `error.SourceFailed` is returned.
-pub fn fetch(gpa: Allocator, arena: Allocator, io: Io, src: Source, cal: *calendar.Calendar) FetchError!u64 {
+pub fn fetch(gpa: Allocator, arena: Allocator, io: Io, cc: CacheConfig, src: Source, cal: *calendar.Calendar) FetchError!u64 {
     return switch (src) {
         .github => |g| fetchGithub(arena, io, g.user, cal),
-        .gitlab => |g| fetchGitlab(gpa, arena, io, g.host, g.user, cal),
+        .gitlab => |g| fetchGitlab(gpa, arena, io, cc, g.host, g.user, cal),
     };
 }
 
@@ -177,18 +185,34 @@ pub const Identity = struct {
     }
 };
 
-fn fetchGitlab(gpa: Allocator, arena: Allocator, io: Io, host: []const u8, user: []const u8, cal: *calendar.Calendar) FetchError!u64 {
+/// Cached path: one probe (the newest push event id) decides whether anything changed. Any change,
+/// an expired or too-narrow cache, or `--refresh` falls through to a full scan, which rewrites the
+/// cache. Counts go into a private calendar so the cache never contains other sources' data.
+fn fetchGitlab(gpa: Allocator, arena: Allocator, io: Io, cc: CacheConfig, host: []const u8, user: []const u8, cal: *calendar.Calendar) FetchError!u64 {
+    const cache_path: ?[]const u8 = if (cc.dir) |d|
+        try cache.pathFor(arena, d, try std.fmt.allocPrint(arena, "gitlab_{s}_{s}", .{ host, user }))
+    else
+        null;
+    const today = cache.utcToday(io);
+
+    if (!cc.refresh) if (cache_path) |p| if (try cache.load(arena, io, p)) |entry| {
+        if (try gitlabCacheHit(arena, io, host, user, entry, cal, today)) |total| return total;
+    };
+
     const ident = try gitlabIdentity(arena, io, host, user);
 
     var scratch: std.heap.ArenaAllocator = .init(gpa);
     defer scratch.deinit();
 
+    var own = calendar.Calendar.init(cal.end);
+
     // `after`/`before` are exclusive.
-    const after = date.Date.fromEpochDay(cal.start - 1);
-    const before = date.Date.fromEpochDay(cal.end + 1);
+    const after = date.Date.fromEpochDay(own.start - 1);
+    const before = date.Date.fromEpochDay(own.end + 1);
 
     // 1. Projects the user pushed to in the window.
     var projects: std.AutoArrayHashMapUnmanaged(u64, void) = .empty;
+    var latest_event: u64 = 0;
     var page: u32 = 1;
     while (page <= gitlab_max_pages) : (page += 1) {
         _ = scratch.reset(.retain_capacity);
@@ -198,11 +222,12 @@ fn fetchGitlab(gpa: Allocator, arena: Allocator, io: Io, host: []const u8, user:
             .{ ident.id, after, before, gitlab_page_size, page },
         );
         const body = try capture(scratch.allocator(), io, &.{ "glab", "api", "--hostname", host, endpoint }, false);
-        const n = parseGitlabProjects(scratch.allocator(), arena, body, &projects) catch |err| {
+        const r = parseGitlabProjects(scratch.allocator(), arena, body, &projects) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             return error.SourceFailed;
         };
-        if (n < gitlab_page_size) break;
+        if (page == 1) latest_event = r.max_id; // newest first; read before the commit scan starts
+        if (r.events < gitlab_page_size) break;
     }
     std.debug.print("  {d} projects with pushes\n", .{projects.count()});
 
@@ -212,7 +237,7 @@ fn fetchGitlab(gpa: Allocator, arena: Allocator, io: Io, host: []const u8, user:
     var total: u64 = 0;
     var skipped: usize = 0;
     for (projects.keys()) |project_id| {
-        total += gitlabProjectCommits(gpa, &scratch, io, host, project_id, ident, after, before, &seen, cal) catch |err| switch (err) {
+        total += gitlabProjectCommits(gpa, &scratch, io, host, project_id, ident, after, before, &seen, &own) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.SourceFailed, error.BadResponse => {
                 skipped += 1;
@@ -221,7 +246,43 @@ fn fetchGitlab(gpa: Allocator, arena: Allocator, io: Io, host: []const u8, user:
         };
     }
     if (skipped != 0) std.debug.print("  skipped {d} projects (no access, deleted or unreadable)\n", .{skipped});
+
+    // A partial scan must not be cached as if it were complete.
+    if (cache_path) |p| if (skipped == 0) {
+        cache.save(arena, io, p, cache.Entry.fromCalendar(ident.id, latest_event, today, &own)) catch |err| {
+            std.debug.print("  cache: could not write {s}: {s}\n", .{ p, @errorName(err) });
+        };
+    };
+
+    cal.merge(&own);
     return total;
+}
+
+/// Returns the cached total if nothing changed upstream, null if a full scan is needed.
+fn gitlabCacheHit(arena: Allocator, io: Io, host: []const u8, user: []const u8, entry: cache.Entry, cal: *calendar.Calendar, today: i32) FetchError!?u64 {
+    if (!entry.usableFor(cal, today)) {
+        std.debug.print("  cache expired or does not cover this window; rescanning\n", .{});
+        return null;
+    }
+    if (isMe(user)) {
+        // Logging in as someone else on the same host must not reuse the previous account's counts.
+        const body = try capture(arena, io, &.{ "glab", "api", "--hostname", host, "user" }, false);
+        const p = std.json.parseFromSliceLeaky(GlProfile, arena, body, .{ .ignore_unknown_fields = true }) catch return null;
+        if (p.id != entry.user_id) return null;
+    }
+    const endpoint = try std.fmt.allocPrint(arena, "users/{d}/events?action=pushed&per_page=1", .{entry.user_id});
+    const body = try capture(arena, io, &.{ "glab", "api", "--hostname", host, endpoint }, false);
+    var ignored: std.AutoArrayHashMapUnmanaged(u64, void) = .empty;
+    const page = parseGitlabProjects(arena, arena, body, &ignored) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        return error.SourceFailed;
+    };
+    if (page.max_id != entry.last_event_id) {
+        std.debug.print("  new pushes since the last scan; rescanning\n", .{});
+        return null;
+    }
+    std.debug.print("  cache hit: no new pushes\n", .{});
+    return entry.applyTo(cal);
 }
 
 fn gitlabProjectCommits(
@@ -319,21 +380,28 @@ fn addNonEmpty(arena: Allocator, list: *std.ArrayList([]const u8), s: anytype) A
     try list.append(arena, v);
 }
 
-const GlEvent = struct { project_id: ?u64 = null };
+const GlEvent = struct { id: u64 = 0, project_id: ?u64 = null };
 
-/// Adds the project ids of one page of `users/:id/events` to `projects`; returns the page's event count.
+pub const EventPage = struct { events: usize, max_id: u64 };
+
+/// Adds the project ids of one page of `users/:id/events` to `projects`. Returns the page's event
+/// count and its highest event id (GitLab ids grow over time; 0 for an empty page).
 pub fn parseGitlabProjects(
     scratch: Allocator,
     arena: Allocator,
     body: []const u8,
     projects: *std.AutoArrayHashMapUnmanaged(u64, void),
-) !usize {
+) !EventPage {
     const events = std.json.parseFromSliceLeaky([]const GlEvent, scratch, body, .{ .ignore_unknown_fields = true }) catch {
         std.debug.print("  gitlab: unexpected events response\n", .{});
         return error.BadResponse;
     };
-    for (events) |ev| if (ev.project_id) |id| try projects.put(arena, id, {});
-    return events.len;
+    var max_id: u64 = 0;
+    for (events) |ev| {
+        max_id = @max(max_id, ev.id);
+        if (ev.project_id) |id| try projects.put(arena, id, {});
+    }
+    return .{ .events = events.len, .max_id = max_id };
 }
 
 const GlCommit = struct {
@@ -425,13 +493,20 @@ test "gitlab: project discovery from push events" {
     const arena = arena_state.allocator();
     var projects: std.AutoArrayHashMapUnmanaged(u64, void) = .empty;
     const body =
-        \\[{"id":1,"project_id":241,"push_data":{"commit_count":622,"action":"created"}},
-        \\ {"id":2,"project_id":241,"push_data":{"commit_count":2,"action":"pushed"}},
-        \\ {"id":3,"project_id":257,"push_data":{"commit_count":1}}]
+        \\[{"id":900,"project_id":241,"push_data":{"commit_count":622,"action":"created"}},
+        \\ {"id":700,"project_id":241,"push_data":{"commit_count":2,"action":"pushed"}},
+        \\ {"id":300,"project_id":257,"push_data":{"commit_count":1}}]
     ;
-    try std.testing.expectEqual(@as(usize, 3), try parseGitlabProjects(arena, arena, body, &projects));
+    const page = try parseGitlabProjects(arena, arena, body, &projects);
+    try std.testing.expectEqual(@as(usize, 3), page.events);
+    try std.testing.expectEqual(@as(u64, 900), page.max_id); // what the cache probe compares
     try std.testing.expectEqual(@as(usize, 2), projects.count());
     try std.testing.expect(projects.contains(241) and projects.contains(257));
+
+    // No pushes at all: id 0, which a cache entry for an idle account also stores.
+    const empty = try parseGitlabProjects(arena, arena, "[]", &projects);
+    try std.testing.expectEqual(@as(usize, 0), empty.events);
+    try std.testing.expectEqual(@as(u64, 0), empty.max_id);
 }
 
 test "gitlab: commits are counted by author, not by push size, merges and duplicates excluded" {

@@ -25,10 +25,14 @@ const usage =
     \\  --fps N              frames per second (default 30)
     \\  --static             print only the final frame
     \\  --no-color           plain glyphs instead of 24-bit colour (also honours NO_COLOR)
+    \\  --refresh            ignore the GitLab cache and rescan (the cache is rewritten)
+    \\  --no-cache           neither read nor write the cache
     \\  --config PATH        config file (default $XDG_CONFIG_HOME/commitflow/config)
     \\  -h, --help           show this help
     \\
     \\config file lines:  github = USER   |   gitlab = [HOST/]USER   |   # comment
+    \\cache: $XDG_CACHE_HOME/commitflow/ (default ~/.cache/commitflow/), GitLab only; reused while
+    \\no new push event appears and the last full scan is at most 7 days old.
     \\
 ;
 
@@ -39,6 +43,8 @@ const Options = struct {
     fps: u32 = 30,
     static: bool = false,
     no_color: bool = false,
+    refresh: bool = false,
+    no_cache: bool = false,
     config_path: ?[]const u8 = null,
     help: bool = false,
 };
@@ -56,6 +62,10 @@ fn parseArgs(arena: Allocator, args: []const [:0]const u8) ArgError!Options {
             o.static = true;
         } else if (eq(a, "--no-color")) {
             o.no_color = true;
+        } else if (eq(a, "--refresh")) {
+            o.refresh = true;
+        } else if (eq(a, "--no-cache")) {
+            o.no_cache = true;
         } else if (eq(a, "--github")) {
             try o.sources.append(arena, .{ .github = .{ .user = try value(args, &i) } });
         } else if (eq(a, "--gitlab")) {
@@ -112,13 +122,17 @@ pub fn main(init: std.process.Init) !u8 {
 
     const today = if (opts.end) |d| d.toEpochDay() else try todayEpochDay(arena, io);
     var cal = calendar.Calendar.init(today);
+    const cc: source.CacheConfig = .{
+        .dir = if (opts.no_cache) null else try defaultCacheDir(arena, init.environ_map),
+        .refresh = opts.refresh,
+    };
 
     var failed: usize = 0;
     var labels: std.ArrayList(u8) = .empty;
     for (sources) |src| {
         const label = try src.label(arena);
         std.debug.print("fetching {s} ...\n", .{label});
-        const added = source.fetch(init.gpa, arena, io, src, &cal) catch |err| switch (err) {
+        const added = source.fetch(init.gpa, arena, io, cc, src, &cal) catch |err| switch (err) {
             error.OutOfMemory => return err,
             error.SourceFailed, error.BadResponse => {
                 failed += 1;
@@ -171,6 +185,12 @@ fn resolveSources(arena: Allocator, io: Io, env: *const std.process.Environ.Map,
     const default = try arena.alloc(source.Source, 1);
     default[0] = .{ .github = .{ .user = source.me } };
     return default;
+}
+
+fn defaultCacheDir(arena: Allocator, env: *const std.process.Environ.Map) Allocator.Error!?[]const u8 {
+    if (env.get("XDG_CACHE_HOME")) |x| if (x.len != 0) return try std.fmt.allocPrint(arena, "{s}/commitflow", .{x});
+    if (env.get("HOME")) |h| if (h.len != 0) return try std.fmt.allocPrint(arena, "{s}/.cache/commitflow", .{h});
+    return null;
 }
 
 fn defaultConfigPath(arena: Allocator, env: *const std.process.Environ.Map) Allocator.Error!?[]const u8 {
@@ -243,6 +263,7 @@ fn play(io: Io, env: *const std.process.Environ.Map, opts: *const Options, cal: 
 }
 
 test {
+    _ = @import("cache.zig");
     _ = @import("calendar.zig");
     _ = @import("config.zig");
     _ = @import("date.zig");
