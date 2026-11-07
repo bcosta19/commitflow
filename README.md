@@ -1,28 +1,28 @@
 # commitflow
 
-Animação no terminal de um ano de commits (GitHub + GitLab): um heatmap estilo GitHub é revelado dia a dia, com um gráfico de barras do volume semanal crescendo embaixo, contador acumulado e um resumo no final (dias ativos, maior sequência, dia mais intenso).
+A terminal animation of a year of commits (GitHub + GitLab): a GitHub-style heatmap is revealed day by day while a weekly-volume bar chart grows underneath it, with a running counter and a summary at the end (active days, longest streak, busiest day).
 
-Zig 0.17, sem dependências. Só Linux (tamanho do terminal via `ioctl`).
+Zig 0.17, no dependencies. Linux only (terminal size via `ioctl`).
 
-## Uso
+## Usage
 
 ```sh
 zig build -Doptimize=ReleaseSafe
-./zig-out/bin/commitflow                       # fontes do arquivo de config
-./zig-out/bin/commitflow --github @me --gitlab gitlab.example.org/usuario
-./zig-out/bin/commitflow --static              # só o último frame (também se stdout não for TTY)
+./zig-out/bin/commitflow                       # sources from the config file
+./zig-out/bin/commitflow --github @me --gitlab gitlab.example.org/alice
+./zig-out/bin/commitflow --static              # final frame only (also when stdout is not a TTY)
 ```
 
-Opções: `--end YYYY-MM-DD`, `--duration SEGUNDOS` (6), `--fps N` (30), `--no-color`, `--config CAMINHO`, `--refresh`, `--no-cache`. `NO_COLOR` é respeitado. Ctrl-C restaura o cursor.
+Options: `--end YYYY-MM-DD`, `--duration SECONDS` (6), `--fps N` (30), `--no-color`, `--config PATH`, `--refresh`, `--no-cache`. `NO_COLOR` is honoured. Ctrl-C restores the cursor.
 
-### Fontes
+### Sources
 
-Autenticação fica por conta dos CLIs `gh` e `glab` já logados; o commitflow não toca em tokens.
+Authentication is left to the already logged-in `gh` and `glab` CLIs; commitflow never touches tokens.
 
-- `--github USER` — `@me` é o usuário autenticado.
-- `--gitlab SPEC` — `USER` (gitlab.com), `HOST/USER` ou `HOST/` (usuário autenticado em HOST). Repetível.
+- `--github USER` — `@me` is the authenticated user.
+- `--gitlab SPEC` — `USER` (gitlab.com), `HOST/USER` or `HOST/` (the authenticated user on HOST). Repeatable.
 
-Sem flags, lê `$XDG_CONFIG_HOME/commitflow/config` (ou `~/.config/commitflow/config`); sem arquivo, usa `--github @me`.
+With no flags it reads `$XDG_CONFIG_HOME/commitflow/config` (or `~/.config/commitflow/config`); without a file it uses `--github @me`.
 
 ```
 # ~/.config/commitflow/config
@@ -30,32 +30,32 @@ github = @me
 gitlab = gitlab.example.org/alice
 ```
 
-Uma fonte que falha (ex.: GitLab interno sem VPN, timeout de 25 s) vira aviso e as demais continuam.
+A source that fails (e.g. an internal GitLab while off the VPN; 25 s timeout) becomes a warning and the others carry on.
 
 ### Cache
 
-Cada conta (GitHub ou GitLab) tem um arquivo binário em `$XDG_CACHE_HOME/commitflow/` (padrão `~/.cache/commitflow/`), com as contagens por dia (36 bytes de cabeçalho + 4 bytes por dia, ~1,5 KB). A cada execução o programa faz **uma** chamada barata e compara o resultado com o que está no cache:
+Each account (GitHub or GitLab) gets a binary file in `$XDG_CACHE_HOME/commitflow/` (default `~/.cache/commitflow/`) with the per-day counts (36-byte header + 4 bytes per day, about 1.5 KB). On every run the program makes **one** cheap call and compares its result with what the cache holds:
 
-| Fonte | Chamada | Compara | Com cache | Sem cache |
+| Source | Call | Compares | With cache | Without cache |
 |---|---|---|---|---|
-| GitLab | `users/:id/events?per_page=1` | id do push mais recente | ~0,2 s | ~15-20 s |
-| GitHub | GraphQL `totalContributions` dos últimos 365 dias | total de contribuições | ~0,6 s | ~1,9 s |
+| GitLab | `users/:id/events?per_page=1` | newest push event id | ~0.2 s | ~15-20 s |
+| GitHub | GraphQL `totalContributions` over the last 365 days | contribution total | ~0.6 s | ~1.9 s |
 
-Se for igual, usa o cache. Se mudou, refaz a busca completa e regrava o arquivo. A busca completa também ocorre com cache com mais de 7 dias, que não cobre a janela, corrompido, de outra conta (o login do GitHub é guardado como hash; no GitLab `@me` confere o id) ou com `--refresh`. `--no-cache` desliga leitura e escrita.
+If they match, the cache is used. If not, a full fetch runs and the file is rewritten. A full fetch also happens when the cache is older than 7 days, does not cover the window, is corrupted, belongs to another account (the GitHub login is stored as a hash; for GitLab `@me` checks the user id) or `--refresh` is given. `--no-cache` disables both reading and writing.
 
-Limites:
+Limits:
 
-- GitLab: rebase, force-push ou branch apagada não geram push novo; o TTL de 7 dias (ou `--refresh`) corrige isso. Um scan em que algum projeto falhou não é gravado.
-- GitHub: o total só cobre os últimos 365 dias; uma mudança nos primeiros ~6 dias da janela de 371 só aparece pelo TTL. Dois ajustes que se compensam exatamente no total também passam despercebidos.
-- GitHub: a busca completa agora faz a sonda mais as duas chamadas de calendário, então um cache vazio custa um pouco mais que antes.
+- GitLab: rebases, force-pushes and deleted branches produce no new push event; the 7-day TTL (or `--refresh`) covers that. A scan in which any project failed is not written.
+- GitHub: the total only covers the last 365 days; a change in the first ~6 days of the 371-day window is only picked up by the TTL. Two changes that cancel out exactly in the total also go unnoticed.
+- GitHub: a full fetch now makes the probe plus the two calendar calls, so a cold cache costs slightly more than it used to.
 
-### O que é contado
+### What is counted
 
-- **GitHub**: calendário de contribuições (GraphQL `contributionCalendar`). O GitHub não expõe série diária só de commits, então PRs, issues e reviews entram na conta.
-- **GitLab**: só commits. Os eventos de push descobrem os projetos; depois cada projeto é listado e contam os commits do usuário (por e-mail verificado ou nome de autor), por `authored_date`, sem merges e sem repetir SHA. `push_data.commit_count` não serve: um push de "created branch" traz o histórico inteiro da branch (centenas de commits).
-- A janela são 53 semanas terminando hoje (data local), alinhada ao domingo.
+- **GitHub**: the contribution calendar (GraphQL `contributionCalendar`). GitHub exposes no commit-only daily series, so PRs, issues and reviews are included.
+- **GitLab**: commits only. Push events discover the projects; each project is then listed and the user's commits are counted (by verified email or author name) on `authored_date`, merges excluded and each SHA once. `push_data.commit_count` is not usable: a "created branch" push carries the whole branch history (hundreds of commits).
+- The window is 53 weeks ending today (local date), aligned to Sunday.
 
-## Desenvolvimento
+## Development
 
 ```sh
 zig build test
