@@ -32,15 +32,22 @@ gitlab = gitlab.example.org/alice
 
 Uma fonte que falha (ex.: GitLab interno sem VPN, timeout de 25 s) vira aviso e as demais continuam.
 
-### Cache (GitLab)
+### Cache
 
-Cada conta GitLab tem um arquivo binário em `$XDG_CACHE_HOME/commitflow/` (padrão `~/.cache/commitflow/`), com as contagens por dia (36 bytes de cabeçalho + 4 bytes por dia, ~1,5 KB). A cada execução o programa faz uma única chamada (`users/:id/events?per_page=1`) e compara o id do push mais recente com o do cache:
+Cada conta (GitHub ou GitLab) tem um arquivo binário em `$XDG_CACHE_HOME/commitflow/` (padrão `~/.cache/commitflow/`), com as contagens por dia (36 bytes de cabeçalho + 4 bytes por dia, ~1,5 KB). A cada execução o programa faz **uma** chamada barata e compara o resultado com o que está no cache:
 
-- igual → usa o cache (~0,2 s em vez de ~18 s);
-- diferente → rescan completo, que regrava o cache;
-- cache com mais de 7 dias, que não cobre a janela, corrompido, de outro usuário (`@me` trocou de conta) ou `--refresh` → rescan completo.
+| Fonte | Chamada | Compara | Com cache | Sem cache |
+|---|---|---|---|---|
+| GitLab | `users/:id/events?per_page=1` | id do push mais recente | ~0,2 s | ~15-20 s |
+| GitHub | GraphQL `totalContributions` dos últimos 365 dias | total de contribuições | ~0,6 s | ~1,9 s |
 
-Limites: rebase, force-push ou branch apagada não geram push novo; o TTL de 7 dias (ou `--refresh`) corrige isso. Um scan em que algum projeto falhou não é gravado. O GitHub não usa cache (2 chamadas, ~1,3 s). `--no-cache` desliga leitura e escrita.
+Se for igual, usa o cache. Se mudou, refaz a busca completa e regrava o arquivo. A busca completa também ocorre com cache com mais de 7 dias, que não cobre a janela, corrompido, de outra conta (o login do GitHub é guardado como hash; no GitLab `@me` confere o id) ou com `--refresh`. `--no-cache` desliga leitura e escrita.
+
+Limites:
+
+- GitLab: rebase, force-push ou branch apagada não geram push novo; o TTL de 7 dias (ou `--refresh`) corrige isso. Um scan em que algum projeto falhou não é gravado.
+- GitHub: o total só cobre os últimos 365 dias; uma mudança nos primeiros ~6 dias da janela de 371 só aparece pelo TTL. Dois ajustes que se compensam exatamente no total também passam despercebidos.
+- GitHub: a busca completa agora faz a sonda mais as duas chamadas de calendário, então um cache vazio custa um pouco mais que antes.
 
 ### O que é contado
 

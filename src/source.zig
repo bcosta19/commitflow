@@ -51,7 +51,7 @@ pub const CacheConfig = struct {
 /// On failure the reason is printed to stderr and `error.SourceFailed` is returned.
 pub fn fetch(gpa: Allocator, arena: Allocator, io: Io, cc: CacheConfig, src: Source, cal: *calendar.Calendar) FetchError!u64 {
     return switch (src) {
-        .github => |g| fetchGithub(arena, io, g.user, cal),
+        .github => |g| fetchGithub(arena, io, cc, g.user, cal),
         .gitlab => |g| fetchGitlab(gpa, arena, io, cc, g.host, g.user, cal),
     };
 }
@@ -85,37 +85,114 @@ pub fn capture(arena: Allocator, io: Io, argv: []const []const u8, quiet: bool) 
 
 // ---------------------------------------------------------------- github
 
-const gh_query_viewer =
-    \\query($from:DateTime!,$to:DateTime!){viewer{contributionsCollection(from:$from,to:$to){contributionCalendar{weeks{contributionDays{date contributionCount}}}}}}
-;
-const gh_query_user =
-    \\query($login:String!,$from:DateTime!,$to:DateTime!){user(login:$login){contributionsCollection(from:$from,to:$to){contributionCalendar{weeks{contributionDays{date contributionCount}}}}}}
-;
+/// GraphQL for the viewer or a named user. `fields` goes inside `contributionCalendar`.
+fn ghQuery(comptime viewer: bool, comptime fields: []const u8) []const u8 {
+    const tail = "login contributionsCollection(from:$from,to:$to){contributionCalendar{" ++ fields ++ "}}}}";
+    return if (viewer)
+        "query($from:DateTime!,$to:DateTime!){viewer{" ++ tail
+    else
+        "query($login:String!,$from:DateTime!,$to:DateTime!){user(login:$login){" ++ tail;
+}
+
+const gh_days_fields = "weeks{contributionDays{date contributionCount}}";
+const gh_total_fields = "totalContributions";
 
 /// GitHub rejects ranges longer than one year, and our window is 53 weeks.
 const github_chunk_days = 180;
+/// The probe asks for the last 365 days in one call; its total is what the cache compares.
+const github_probe_days = 365;
 
-fn fetchGithub(arena: Allocator, io: Io, user: []const u8, cal: *calendar.Calendar) FetchError!u64 {
+fn ghGraphql(arena: Allocator, io: Io, user: []const u8, comptime fields: []const u8, from: i32, to: i32) FetchError![]const u8 {
+    const query = if (isMe(user)) comptime ghQuery(true, fields) else comptime ghQuery(false, fields);
+    const query_arg = try std.fmt.allocPrint(arena, "query={s}", .{query});
+    const from_arg = try std.fmt.allocPrint(arena, "from={f}T00:00:00Z", .{date.Date.fromEpochDay(from)});
+    const to_arg = try std.fmt.allocPrint(arena, "to={f}T23:59:59Z", .{date.Date.fromEpochDay(to)});
+
+    var argv: std.ArrayList([]const u8) = .empty;
+    try argv.appendSlice(arena, &.{ "gh", "api", "graphql", "-f", query_arg, "-f", from_arg, "-f", to_arg });
+    if (!isMe(user)) try argv.appendSlice(arena, &.{ "-f", try std.fmt.allocPrint(arena, "login={s}", .{user}) });
+    return capture(arena, io, argv.items, false);
+}
+
+/// One probe call decides whether the cached calendar is still valid (same account, same total of
+/// contributions over the last 365 days). Anything else refetches and rewrites the cache. Counts go
+/// into a private calendar so the cache never contains other sources' data.
+fn fetchGithub(arena: Allocator, io: Io, cc: CacheConfig, user: []const u8, cal: *calendar.Calendar) FetchError!u64 {
+    const cache_path: ?[]const u8 = if (cc.dir) |d|
+        try cache.pathFor(arena, d, try std.fmt.allocPrint(arena, "github_{s}", .{user}))
+    else
+        null;
+    const today = cache.utcToday(io);
+
+    var probe: GhProbe = undefined;
+    if (cache_path) |p| {
+        const body = try ghGraphql(arena, io, user, gh_total_fields, cal.end - (github_probe_days - 1), cal.end);
+        probe = parseGithubProbe(arena, body) catch |err| {
+            if (err == error.OutOfMemory) return error.OutOfMemory;
+            return error.SourceFailed;
+        };
+        if (!cc.refresh) if (try cache.load(arena, io, p)) |entry| {
+            if (!entry.usableFor(cal, today)) {
+                std.debug.print("  cache expired or does not cover this window; refetching\n", .{});
+            } else if (entry.user_id != probe.user_id or entry.change_token != probe.total) {
+                std.debug.print("  contributions changed since the last fetch; refetching\n", .{});
+            } else {
+                std.debug.print("  cache hit: contribution total unchanged\n", .{});
+                return entry.applyTo(cal);
+            }
+        };
+    }
+
+    var own = calendar.Calendar.init(cal.end);
     var total: u64 = 0;
-    var from = cal.start;
-    while (from <= cal.end) {
-        const to = @min(from + github_chunk_days - 1, cal.end);
-        const from_arg = try std.fmt.allocPrint(arena, "from={f}T00:00:00Z", .{date.Date.fromEpochDay(from)});
-        const to_arg = try std.fmt.allocPrint(arena, "to={f}T23:59:59Z", .{date.Date.fromEpochDay(to)});
-        const query_arg = try std.fmt.allocPrint(arena, "query={s}", .{if (isMe(user)) gh_query_viewer else gh_query_user});
-
-        var argv: std.ArrayList([]const u8) = .empty;
-        try argv.appendSlice(arena, &.{ "gh", "api", "graphql", "-f", query_arg, "-f", from_arg, "-f", to_arg });
-        if (!isMe(user)) try argv.appendSlice(arena, &.{ "-f", try std.fmt.allocPrint(arena, "login={s}", .{user}) });
-
-        const body = try capture(arena, io, argv.items, false);
-        total += parseGithubCalendar(arena, body, cal) catch |err| {
+    var from = own.start;
+    while (from <= own.end) {
+        const to = @min(from + github_chunk_days - 1, own.end);
+        const body = try ghGraphql(arena, io, user, gh_days_fields, from, to);
+        total += parseGithubCalendar(arena, body, &own) catch |err| {
             if (err == error.OutOfMemory) return error.OutOfMemory;
             return error.SourceFailed;
         };
         from = to + 1;
     }
+
+    if (cache_path) |p| {
+        cache.save(arena, io, p, cache.Entry.fromCalendar(probe.user_id, probe.total, today, &own)) catch |err| {
+            std.debug.print("  cache: could not write {s}: {s}\n", .{ p, @errorName(err) });
+        };
+    }
+    cal.merge(&own);
     return total;
+}
+
+pub const GhProbe = struct { user_id: u64, total: u64 };
+const GhProbeUser = struct {
+    login: []const u8,
+    contributionsCollection: struct { contributionCalendar: struct { totalContributions: u64 } },
+};
+
+/// Parses the probe response: a hash of the login (account identity) and the contribution total.
+pub fn parseGithubProbe(arena: Allocator, body: []const u8) !GhProbe {
+    const Resp = struct {
+        data: ?struct { viewer: ?GhProbeUser = null, user: ?GhProbeUser = null } = null,
+        errors: ?[]const GhError = null,
+    };
+    const resp = std.json.parseFromSliceLeaky(Resp, arena, body, .{ .ignore_unknown_fields = true }) catch {
+        std.debug.print("  github: unexpected response\n", .{});
+        return error.BadResponse;
+    };
+    if (resp.errors) |errs| {
+        if (errs.len > 0) std.debug.print("  github: {s}\n", .{errs[0].message});
+    }
+    const data = resp.data orelse return error.BadResponse;
+    const u = data.viewer orelse data.user orelse {
+        std.debug.print("  github: user not found\n", .{});
+        return error.BadResponse;
+    };
+    return .{
+        .user_id = std.hash.Wyhash.hash(0, u.login),
+        .total = u.contributionsCollection.contributionCalendar.totalContributions,
+    };
 }
 
 const GhDay = struct { date: []const u8, contributionCount: u32 };
@@ -277,7 +354,7 @@ fn gitlabCacheHit(arena: Allocator, io: Io, host: []const u8, user: []const u8, 
         if (err == error.OutOfMemory) return error.OutOfMemory;
         return error.SourceFailed;
     };
-    if (page.max_id != entry.last_event_id) {
+    if (page.max_id != entry.change_token) {
         std.debug.print("  new pushes since the last scan; rescanning\n", .{});
         return null;
     }
@@ -536,4 +613,24 @@ test "gitlab: commits are counted by author, not by push size, merges and duplic
     // Same SHA in another project (fork/mirror) is not counted twice.
     const again = try countGitlabCommits(std.testing.allocator, arena, body, ident, &seen, &cal);
     try std.testing.expectEqual(@as(u64, 0), again.counted);
+}
+
+test "github probe: login hash and total, viewer and user shapes" {
+    var arena_state: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const viewer =
+        \\{"data":{"viewer":{"login":"bcosta19","contributionsCollection":{"contributionCalendar":{"totalContributions":1616}}}}}
+    ;
+    const user =
+        \\{"data":{"user":{"login":"bcosta19","contributionsCollection":{"contributionCalendar":{"totalContributions":1617}}}}}
+    ;
+    const v = try parseGithubProbe(a, viewer);
+    const u = try parseGithubProbe(a, user);
+    try std.testing.expectEqual(@as(u64, 1616), v.total);
+    try std.testing.expectEqual(@as(u64, 1617), u.total); // a new contribution changes the token
+    try std.testing.expectEqual(v.user_id, u.user_id); // same login, same identity
+    const other = try parseGithubProbe(a, "{\"data\":{\"viewer\":{\"login\":\"someone\",\"contributionsCollection\":{\"contributionCalendar\":{\"totalContributions\":1616}}}}}");
+    try std.testing.expect(other.user_id != v.user_id); // an account switch is detected even with equal totals
+    try std.testing.expectError(error.BadResponse, parseGithubProbe(a, "{\"data\":{\"user\":null},\"errors\":[{\"message\":\"Could not resolve to a User\"}]}"));
 }

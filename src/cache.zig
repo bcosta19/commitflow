@@ -1,9 +1,9 @@
-//! Binary cache of one GitLab source's per-day counts, so an unchanged account costs a single
-//! one-line API probe instead of a full scan of every project.
+//! Binary cache of one source's per-day counts, so an unchanged account costs a single cheap probe
+//! instead of a full scan.
 //!
 //! Layout, little endian (36-byte header + `n` counts):
 //!
-//!     "CFLW" | version u8 | 3 pad | user_id u64 | last_event_id u64
+//!     "CFLW" | version u8 | 3 pad | user_id u64 | change_token u64
 //!            | full_scan_day i32 | start_day i32 | n u32 | counts[n] u32
 //!
 //! Days are stored by epoch day, not by grid position, because the window slides every day.
@@ -23,19 +23,21 @@ const max_days = 4096;
 pub const ttl_days = 7;
 
 pub const Entry = struct {
+    /// Identifies the account: GitLab user id, or a hash of the GitHub login.
     user_id: u64,
-    /// Newest push event id seen by the scan that produced this entry.
-    last_event_id: u64,
+    /// What the cheap probe returns while nothing changed: GitLab's newest push event id, or
+    /// GitHub's total contributions over the probe range. Taken by the scan that produced this entry.
+    change_token: u64,
     /// UTC epoch day of that scan.
     full_scan_day: i32,
     /// Epoch day of `counts[0]`.
     start_day: i32,
     counts: []const u32,
 
-    pub fn fromCalendar(user_id: u64, last_event_id: u64, scan_day: i32, cal: *const calendar.Calendar) Entry {
+    pub fn fromCalendar(user_id: u64, change_token: u64, scan_day: i32, cal: *const calendar.Calendar) Entry {
         return .{
             .user_id = user_id,
-            .last_event_id = last_event_id,
+            .change_token = change_token,
             .full_scan_day = scan_day,
             .start_day = cal.start,
             .counts = &cal.counts,
@@ -67,7 +69,7 @@ pub fn encode(arena: Allocator, e: Entry) Allocator.Error![]u8 {
     buf[4] = version;
     @memset(buf[5..8], 0);
     std.mem.writeInt(u64, buf[8..16], e.user_id, .little);
-    std.mem.writeInt(u64, buf[16..24], e.last_event_id, .little);
+    std.mem.writeInt(u64, buf[16..24], e.change_token, .little);
     std.mem.writeInt(i32, buf[24..28], e.full_scan_day, .little);
     std.mem.writeInt(i32, buf[28..32], e.start_day, .little);
     std.mem.writeInt(u32, buf[32..36], @intCast(e.counts.len), .little);
@@ -84,7 +86,7 @@ pub fn decode(arena: Allocator, bytes: []const u8) Allocator.Error!?Entry {
     for (counts, 0..) |*c, i| c.* = std.mem.readInt(u32, bytes[header_len + i * 4 ..][0..4], .little);
     return .{
         .user_id = std.mem.readInt(u64, bytes[8..16], .little),
-        .last_event_id = std.mem.readInt(u64, bytes[16..24], .little),
+        .change_token = std.mem.readInt(u64, bytes[16..24], .little),
         .full_scan_day = std.mem.readInt(i32, bytes[24..28], .little),
         .start_day = std.mem.readInt(i32, bytes[28..32], .little),
         .counts = counts,
@@ -128,10 +130,10 @@ test "encode/decode round trip" {
     defer arena_state.deinit();
     const a = arena_state.allocator();
     const counts = [_]u32{ 0, 5, 0, 4_000_000_000, 7 };
-    const e: Entry = .{ .user_id = 213, .last_event_id = 5003131123, .full_scan_day = -3, .start_day = 20400, .counts = &counts };
+    const e: Entry = .{ .user_id = 213, .change_token = 5003131123, .full_scan_day = -3, .start_day = 20400, .counts = &counts };
     const got = (try decode(a, try encode(a, e))).?;
     try std.testing.expectEqual(e.user_id, got.user_id);
-    try std.testing.expectEqual(e.last_event_id, got.last_event_id);
+    try std.testing.expectEqual(e.change_token, got.change_token);
     try std.testing.expectEqual(e.full_scan_day, got.full_scan_day);
     try std.testing.expectEqual(e.start_day, got.start_day);
     try std.testing.expectEqualSlices(u32, &counts, got.counts);
@@ -142,7 +144,7 @@ test "decode treats damaged files as a miss" {
     defer arena_state.deinit();
     const a = arena_state.allocator();
     const counts = [_]u32{ 1, 2, 3 };
-    const good = try encode(a, .{ .user_id = 1, .last_event_id = 2, .full_scan_day = 3, .start_day = 4, .counts = &counts });
+    const good = try encode(a, .{ .user_id = 1, .change_token = 2, .full_scan_day = 3, .start_day = 4, .counts = &counts });
 
     try std.testing.expect(try decode(a, good[0 .. good.len - 1]) == null); // truncated
     try std.testing.expect(try decode(a, good[0..10]) == null);
@@ -162,7 +164,7 @@ test "usableFor: coverage and TTL" {
     const end = (try date.Date.parse("2026-11-07")).toEpochDay();
     const cal = calendar.Calendar.init(end);
     const counts = [_]u32{0};
-    var e: Entry = .{ .user_id = 1, .last_event_id = 1, .full_scan_day = end, .start_day = cal.start, .counts = &counts };
+    var e: Entry = .{ .user_id = 1, .change_token = 1, .full_scan_day = end, .start_day = cal.start, .counts = &counts };
     try std.testing.expect(e.usableFor(&cal, end));
     try std.testing.expect(e.usableFor(&cal, end + ttl_days));
     try std.testing.expect(!e.usableFor(&cal, end + ttl_days + 1));
@@ -204,8 +206,8 @@ test "save and load through the filesystem" {
 
     try std.testing.expect(try load(a, io, path) == null); // missing file is a miss
     const counts = [_]u32{ 3, 0, 8 };
-    try save(a, io, path, .{ .user_id = 9, .last_event_id = 77, .full_scan_day = 1, .start_day = 2, .counts = &counts });
+    try save(a, io, path, .{ .user_id = 9, .change_token = 77, .full_scan_day = 1, .start_day = 2, .counts = &counts });
     const got = (try load(a, io, path)).?;
-    try std.testing.expectEqual(@as(u64, 77), got.last_event_id);
+    try std.testing.expectEqual(@as(u64, 77), got.change_token);
     try std.testing.expectEqualSlices(u32, &counts, got.counts);
 }
