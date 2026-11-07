@@ -196,6 +196,8 @@ pub const Renderer = struct {
         if (i >= visible) return palette[0];
         const count = self.cal.counts[i];
         const base = palette[calendar.level(count, self.thresholds)];
+        // Once everything is revealed the picture settles: no scan head, no fade.
+        if (visible > self.cal.lastIndex()) return base;
         const age = visible - 1 - i;
         if (age == 0) return white; // scan head
         if (count > 0 and age < flash_days) return mix(white, base, age, flash_days);
@@ -383,4 +385,20 @@ test "thousands separators" {
     try aw.writer.writeByte(' ');
     try writeCount(&aw.writer, 1000);
     try std.testing.expectEqualStrings("1,234,567 999 1,000", aw.written());
+}
+
+test "the scan head is white while revealing and gone once settled" {
+    const cal = try sampleCalendar();
+    const r = Renderer.init(&cal, 2, true, "test");
+    const white_seq = "\x1b[38;2;255;255;255m";
+
+    var mid: Writer.Allocating = .init(std.testing.allocator);
+    defer mid.deinit();
+    try r.frame(&mid.writer, 100);
+    try std.testing.expect(std.mem.indexOf(u8, mid.written(), white_seq) != null);
+
+    var done: Writer.Allocating = .init(std.testing.allocator);
+    defer done.deinit();
+    try r.frame(&done.writer, 9999);
+    try std.testing.expect(std.mem.indexOf(u8, done.written(), white_seq) == null);
 }

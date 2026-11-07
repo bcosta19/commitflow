@@ -4,16 +4,29 @@ A terminal animation of a year of commits (GitHub + GitLab): a GitHub-style heat
 
 Zig 0.17, no dependencies. Linux only (terminal size via `ioctl`).
 
+## Demo
+
+![commitflow demo animation](docs/demo.gif)
+
+Try it without any account, network access or CLI tools: `--demo` animates a deterministic, synthetic year of commits.
+
+```sh
+zig build -Doptimize=ReleaseSafe
+./zig-out/bin/commitflow --demo
+```
+
+The GIF above is a capture of exactly that command (`python3 scripts/make-demo-gif.py` regenerates it from the real binary; it needs Pillow and `script`). The animation is `--duration` seconds long, eased (slow start, fast middle, slow finish); the white cell is the day being revealed.
+
 ## Usage
 
 ```sh
 zig build -Doptimize=ReleaseSafe
 ./zig-out/bin/commitflow                       # sources from the config file
 ./zig-out/bin/commitflow --github @me --gitlab gitlab.example.org/alice
-./zig-out/bin/commitflow --static              # final frame only (also when stdout is not a TTY)
+./zig-out/bin/commitflow --static              # final frame only (also when stdout is not a TTY; `COLUMNS` then picks the width, e.g. `COLUMNS=80`)
 ```
 
-Options: `--end YYYY-MM-DD`, `--duration SECONDS` (6), `--fps N` (30), `--no-color`, `--config PATH`, `--refresh`, `--no-cache`. `NO_COLOR` is honoured. Ctrl-C restores the cursor.
+Options: `--end YYYY-MM-DD`, `--duration SECONDS` (6), `--fps N` (30), `--no-color`, `--config PATH`, `--refresh`, `--no-cache`, `--demo`. `NO_COLOR` is honoured. Ctrl-C restores the cursor.
 
 ### Sources
 

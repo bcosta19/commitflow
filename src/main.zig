@@ -5,6 +5,7 @@ const Allocator = std.mem.Allocator;
 const calendar = @import("calendar.zig");
 const config = @import("config.zig");
 const date = @import("date.zig");
+const demo = @import("demo.zig");
 const render = @import("render.zig");
 const source = @import("source.zig");
 const term = @import("term.zig");
@@ -27,6 +28,7 @@ const usage =
     \\  --no-color           plain glyphs instead of 24-bit colour (also honours NO_COLOR)
     \\  --refresh            ignore the GitLab cache and rescan (the cache is rewritten)
     \\  --no-cache           neither read nor write the cache
+    \\  --demo               animate synthetic data (no accounts, network or CLI tools needed)
     \\  --config PATH        config file (default $XDG_CONFIG_HOME/commitflow/config)
     \\  -h, --help           show this help
     \\
@@ -45,6 +47,7 @@ const Options = struct {
     no_color: bool = false,
     refresh: bool = false,
     no_cache: bool = false,
+    demo: bool = false,
     config_path: ?[]const u8 = null,
     help: bool = false,
 };
@@ -66,6 +69,8 @@ fn parseArgs(arena: Allocator, args: []const [:0]const u8) ArgError!Options {
             o.refresh = true;
         } else if (eq(a, "--no-cache")) {
             o.no_cache = true;
+        } else if (eq(a, "--demo")) {
+            o.demo = true;
         } else if (eq(a, "--github")) {
             try o.sources.append(arena, .{ .github = .{ .user = try value(args, &i) } });
         } else if (eq(a, "--gitlab")) {
@@ -118,10 +123,20 @@ pub fn main(init: std.process.Init) !u8 {
         return 0;
     }
 
-    const sources = (try resolveSources(arena, io, init.environ_map, &opts)) orelse return 2;
-
     const today = if (opts.end) |d| d.toEpochDay() else try todayEpochDay(arena, io);
     var cal = calendar.Calendar.init(today);
+
+    if (opts.demo) {
+        if (opts.sources.items.len != 0) {
+            std.debug.print("commitflow: --demo cannot be combined with --github/--gitlab\n", .{});
+            return 2;
+        }
+        demo.fill(&cal, demo.default_seed);
+        try play(io, init.environ_map, &opts, &cal, "demo · synthetic data");
+        return 0;
+    }
+
+    const sources = (try resolveSources(arena, io, init.environ_map, &opts)) orelse return 2;
     const cc: source.CacheConfig = .{
         .dir = if (opts.no_cache) null else try defaultCacheDir(arena, init.environ_map),
         .refresh = opts.refresh,
@@ -217,7 +232,9 @@ fn play(io: Io, env: *const std.process.Environ.Map, opts: *const Options, cal: 
     const color = is_tty and !opts.no_color and !no_color_env;
 
     const sz = term.size();
-    const cols = if (sz) |s| s.cols else 200;
+    // Without a TTY (piped output, docs) COLUMNS picks the width, so a narrow frame can be captured.
+    const env_cols: ?usize = if (env.get("COLUMNS")) |c| std.fmt.parseInt(usize, c, 10) catch null else null;
+    const cols = if (sz) |s| s.cols else env_cols orelse 200;
     const cell_w: u8 = if (cols >= render.Renderer.minColumns(2) + 2) 2 else 1;
     if (cols < render.Renderer.minColumns(1)) {
         std.debug.print("commitflow: terminal too narrow ({d} columns, need {d})\n", .{ cols, render.Renderer.minColumns(1) });
@@ -267,6 +284,7 @@ test {
     _ = @import("calendar.zig");
     _ = @import("config.zig");
     _ = @import("date.zig");
+    _ = @import("demo.zig");
     _ = @import("render.zig");
     _ = @import("source.zig");
 }
