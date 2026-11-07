@@ -1,0 +1,7 @@
+.{
+    .name = .commitflow,
+    .version = "0.0.1",
+    .minimum_zig_version = "0.17.0",
+    .paths = .{""},
+    .fingerprint = 0xab2210cee0e97bff,
+}
